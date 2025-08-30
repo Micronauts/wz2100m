@@ -813,7 +813,7 @@ void loadMapPreview(bool hideInterface)
 
 	std::unique_ptr<WzMap::LoggingProtocol> generatePreviewLogger(new WzMapDebugLogger());
 	auto mapPreviewResult = WzMap::generate2DMapPreview(*data, previewColorScheme, WzMap::MapStatsConfiguration(WzMap::MapType::SKIRMISH), generatePreviewLogger.get());
-	if (!mapPreviewResult)
+	if (!mapPreviewResult || mapPreviewResult->width == 0 || mapPreviewResult->height == 0)
 	{
 		// Failed to generate map preview
 		debug(LOG_ERROR, "Failed to generate map preview for: %s", psLevel->pName.c_str());
@@ -1155,9 +1155,6 @@ std::vector<JoinConnectionDescription> findLobbyGame(const std::string& lobbyAdd
 	}
 	std::string host = lobbyGame.desc.host;
 	std::vector<JoinConnectionDescription> connList;
-#ifdef WZ_GNS_NETWORK_BACKEND_ENABLED
-	connList.emplace_back(JoinConnectionDescription::JoinConnectionType::GNS_DIRECT, host, lobbyGame.hostPort);
-#endif
 	connList.emplace_back(JoinConnectionDescription::JoinConnectionType::TCP_DIRECT, host, lobbyGame.hostPort);
 	return connList;
 }

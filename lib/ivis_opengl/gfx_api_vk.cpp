@@ -70,8 +70,8 @@ const uint32_t minSupportedVulkanVersion = VK_API_VERSION_1_0;
 // For debug builds, limit to the minimum that should be supported by this backend (which is Vulkan 1.0, see above)
 const uint32_t maxRequestableInstanceVulkanVersion = VK_API_VERSION_1_0;
 #else
-// For regular builds, currently limit to: Vulkan 1.1
-const uint32_t maxRequestableInstanceVulkanVersion = (uint32_t)VK_MAKE_VERSION(1, 1, 0);
+// For regular builds, currently limit to: Vulkan 1.3
+const uint32_t maxRequestableInstanceVulkanVersion = (uint32_t)VK_MAKE_VERSION(1, 3, 0);
 #endif
 
 const size_t MAX_FRAMES_IN_FLIGHT = 2;
@@ -3596,6 +3596,92 @@ bool VkRoot::createVulkanInstance(uint32_t apiVersion, const std::vector<const c
 	return true;
 }
 
+struct VulkanDeviceBlocklistEntry
+{
+	struct VersionRange
+	{
+		optional<uint32_t> minVersion;
+		optional<uint32_t> maxVersion;
+
+		bool isWithinRange(uint32_t version) const;
+	};
+	optional<uint32_t> vendorID;
+	optional<uint32_t> deviceID;
+	optional<VersionRange> driverVersion;
+	optional<VersionRange> apiVersion;
+};
+
+bool VulkanDeviceBlocklistEntry::VersionRange::isWithinRange(uint32_t version) const
+{
+	if (minVersion.has_value() && version < minVersion.value())
+	{
+		return false;
+	}
+	if (maxVersion.has_value() && version > maxVersion.value())
+	{
+		return false;
+	}
+	return minVersion.has_value() || maxVersion.has_value();
+}
+
+inline constexpr uint32_t kVendorIdIntel = 0x8086;
+
+constexpr VulkanDeviceBlocklistEntry vulkanDeviceBlocklist[] = {
+	// Block old Intel drivers due to crashes (by checking for ones that support < Vulkan 1.1.0 - these should be very old)
+	{ kVendorIdIntel, nullopt, nullopt, VulkanDeviceBlocklistEntry::VersionRange{nullopt, /* maxVersion */ (VK_MAKE_VERSION(1, 1, 0))-1} }
+};
+
+static bool isOnVulkanDeviceBlocklist(const vk::PhysicalDeviceProperties& deviceProperties)
+{
+	for (const auto& blocklistEntry : vulkanDeviceBlocklist)
+	{
+		bool matchedAValue = false;
+
+		if (blocklistEntry.vendorID.has_value())
+		{
+			if (deviceProperties.vendorID != blocklistEntry.vendorID.value())
+			{
+				continue;
+			}
+			matchedAValue = true;
+		}
+
+		if (blocklistEntry.deviceID.has_value())
+		{
+			if (deviceProperties.deviceID != blocklistEntry.deviceID.value())
+			{
+				continue;
+			}
+			matchedAValue = true;
+		}
+
+		if (blocklistEntry.driverVersion.has_value())
+		{
+			if (!blocklistEntry.driverVersion.value().isWithinRange(deviceProperties.driverVersion))
+			{
+				continue;
+			}
+			matchedAValue = true;
+		}
+
+		if (blocklistEntry.apiVersion.has_value())
+		{
+			if (!blocklistEntry.apiVersion.value().isWithinRange(deviceProperties.apiVersion))
+			{
+				continue;
+			}
+			matchedAValue = true;
+		}
+
+		if (matchedAValue)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // WZ-specific functions for rating / determining requirements
 int rateDeviceSuitability(const vk::PhysicalDevice &device, const vk::SurfaceKHR &surface, const WZ_vk::DispatchLoaderDynamic &vkDynLoader)
 {
@@ -3713,6 +3799,12 @@ int rateDeviceSuitability(const vk::PhysicalDevice &device, const vk::SurfaceKHR
 	catch (const vk::SystemError& e)
 	{
 		debug(LOG_3D, "Excluding deviceID [%" PRIu32 "] (%s) because: querySwapChainSupport failed with error: %s", deviceProperties.deviceID, deviceProperties.deviceName.data(), e.what());
+		return 0;
+	}
+
+	if (isOnVulkanDeviceBlocklist(deviceProperties))
+	{
+		debug(LOG_3D, "Excluding deviceID [%" PRIu32 "] (%s) because: on Vulkan blocklist - please update your driver", deviceProperties.deviceID, deviceProperties.deviceName.data());
 		return 0;
 	}
 
@@ -4925,7 +5017,11 @@ bool VkRoot::_initialize(const gfx_api::backend_Impl_Factory& impl, int32_t anti
 		debug(LOG_INFO, "Output_SurfaceInformation failed: %s", e.what());
 	}
 
-	getQueueFamiliesInfo();
+	if (!getQueueFamiliesInfo())
+	{
+		debug(LOG_ERROR, "getQueueFamiliesInfo() failed");
+		return false;
+	}
 
 	if (!createLogicalDevice())
 	{
@@ -5102,20 +5198,28 @@ bool VkRoot::createSurface()
 	return true;
 }
 
-void VkRoot::getQueueFamiliesInfo()
+bool VkRoot::getQueueFamiliesInfo()
 {
 	ASSERT(physicalDevice, "Physical device is null");
 	ASSERT(surface, "Surface is null");
 
 	queueFamilyIndices = findQueueFamilies(physicalDevice, surface, vkDynLoader);
-	ASSERT_OR_RETURN(, queueFamilyIndices.isComplete(), "Did not receive complete indices from findQueueFamilies");
+	ASSERT_OR_RETURN(false, queueFamilyIndices.isComplete(), "Did not receive complete indices from findQueueFamilies");
 
 	// check for optional features of queue family
 	const auto queuesFamilies = physicalDevice.getQueueFamilyProperties(vkDynLoader);
 	uint32_t graphicsFamilyIdx = queueFamilyIndices.graphicsFamily.value();
 	queueSupportsTimestamps = false;
-	ASSERT_OR_RETURN(, graphicsFamilyIdx < queuesFamilies.size(), "Failed to determine queue (%" PRIu32")'s timestampValidBits", graphicsFamilyIdx);
-	queueSupportsTimestamps = (queuesFamilies[graphicsFamilyIdx].timestampValidBits > 0);
+	if (graphicsFamilyIdx < queuesFamilies.size())
+	{
+		queueSupportsTimestamps = (queuesFamilies[graphicsFamilyIdx].timestampValidBits > 0);
+	}
+	else
+	{
+		debug(LOG_INFO, "Failed to determine queue (%" PRIu32")'s timestampValidBits", graphicsFamilyIdx);
+	}
+
+	return true;
 }
 
 bool VkRoot::createLogicalDevice()
@@ -5123,7 +5227,7 @@ bool VkRoot::createLogicalDevice()
 	ASSERT(physicalDevice, "Physical device is null");
 	ASSERT(surface, "Surface is null");
 
-	ASSERT(queueFamilyIndices.isComplete(), "Did not receive complete indices from findQueueFamilies");
+	ASSERT_OR_RETURN(false, queueFamilyIndices.isComplete(), "Did not receive complete indices from findQueueFamilies");
 
 	// determine extensions to use
 	enabledDeviceExtensions = deviceExtensions;
